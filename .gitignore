@@ -2,6 +2,8 @@ target/
 node_modules/
 .env
 .env.*
+!.env.example
+.claude/settings.local.json
 test-ledger/
 .anchor/
 yarn.lock
