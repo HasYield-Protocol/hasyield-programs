@@ -13,50 +13,57 @@ Anchor programs for HasYield — concentrated liquidity bin rehypothecation on S
 
 | Program | Address (Devnet) | Description |
 |---------|-----------------|-------------|
-| LP Vault | `BH6rAqBajhmzjVPoSqyvuyhCphGVWfKGAD7wXwJU9Y7T` | Deposits into DLMM, mints hyLP Token-2022 shares |
-| Lending Pool | `J9cqrTyPAajYNUp5ayDQBso7mMAwyatNg7VMpx8wbzwf` | Accepts hyLP as collateral, enables SOL/USDC borrowing |
+| LP Vault | `BH6rAqBajhmzjVPoSqyvuyhCphGVWfKGAD7wXwJU9Y7T` | Deposits into real Meteora DLMM via CPI, routes SOL to Marinade, mints hyLP Token-2022 shares |
+| Lending Pool | `J9cqrTyPAajYNUp5ayDQBso7mMAwyatNg7VMpx8wbzwf` | Accepts hyLP as collateral, enables USDC borrowing |
 | Transfer Hook | `EupPmtNiCUWcPGh4ekjLUVhf5PqZWV8BN5zE7426n9vM` | Blocks hyLP transfer while collateralized |
+
+## Real CPI Integrations
+
+| Protocol | CPI Type | Instruction | Status |
+|----------|----------|-------------|--------|
+| **Meteora DLMM** | `invoke_signed` | `add_liquidity_by_strategy`, `remove_liquidity_by_range`, `claim_fee` | **Proven on devnet** |
+| **Marinade Finance** | `invoke_signed` | `deposit` (SOL→mSOL), `liquid_unstake` (mSOL→SOL) | **Proven on devnet** |
+| **Solend** | `invoke_signed` | `deposit_reserve_liquidity`, `redeem_reserve_collateral` | Code deployed, needs devnet reserve |
 
 ## Key Addresses (Devnet)
 
 - Deployer wallet: `7LwYZRf5BAiHXNCMyngir3uYEX9XhaGYm4udoPK7CPhq`
-- Test user wallet: `8ku1gytH4qw8SJqeYeRJ2xkqEh1XQPpZAQ5vvRKbUBXu`
-- Vault config PDA: `EDKpihQ98wgB7L865izMuRnvxoBw5syVpzwtbwBzJmzd`
-- hyLP Mint: `EBdngGBEcYFe4dD7Jtk2nPLqwhmC7ud3tkYTdkHFJTRJ`
-- DLMM Pool (SOL/USDC): `EUcPNLCoVFb4YTM87m4Kudv3PAG71k5wGxy2Pug5YknE`
+- Vault config PDA: `5hAGZFirTf7yB9MAfF4MN2iyQ89xDjSewymBAJ5gKZ21`
+- Vault Authority PDA: `9t6Zv8xtZrogbZL44EqdXknNHgron5MTdtSvTHww1vpc`
+- hyLP Mint: `58WoS25fsv2Pod6LkcuvrsF5p19YFfavmaAJAjRuvvMF`
+- DLMM Position: `F3uAc3cjmyRQAvDae2DygXHmmKowhPhZmtzqb1yEanGg`
+- DLMM Pool (USDC/SOL): `EUcPNLCoVFb4YTM87m4Kudv3PAG71k5wGxy2Pug5YknE`
 - USDC Devnet Mint: `4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU`
+- Lending Pool: `AGWpvCjV3sHwkNWLtyT2837URzWmGNGffa5W4eYg1kHR`
+- Vault mSOL ATA: `BhEC5GeSJxgCu4c3w2eZzvm6f5tAwdR8nWTKAtQiTR6B`
 
 ## Technical Notes
 
 - LP vault uses TWO token programs: TOKEN_PROGRAM_ID for SOL/USDC, TOKEN_2022_PROGRAM_ID for hyLP mint/burn
 - Share-based vault math (ERC4626-style) with dead shares anti-inflation
-- 50% LTV lending pool with range-based risk (wider LP range = safer collateral)
-- Old vault configs with (USDC/SOL order) have stale PDA bumps — use SOL/TEST_TOKEN or create fresh pairs
-
-## What's Working
-
-- E2E test passing: `npx ts-node scripts/e2e-test.ts` — deposit SOL → receive hyLP → lending pool init
-- All 3 programs deployed to devnet
-
-## What's TODO
-
-1. Fix simulate_fees in E2E test (wrong mint accounts passed)
-2. Test borrow/repay flow E2E on devnet
-3. Real Meteora DLMM CPI integration (currently simulated)
-4. Kamino Lend devnet integration (staging program: `SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh`)
+- 50% LTV lending pool with flat 5% APR interest
+- DLMM CPI uses raw `invoke_signed` with discriminators from IDL
+- Pool token order: X = USDC (6 decimals), Y = SOL (9 decimals)
+- Position range: bins -34 to 34 (69 bins, centered on active_id=0)
+- Bin array PDAs must use two's complement i64 LE for negative indices
+- SpotImBalanced strategy (variant 6) with parameteres[0]=favorSide for single-token deposits
+- Marinade deposit: vault_authority PDA transfers SOL to Marinade, receives mSOL
+- 30% of deposited SOL routes to Marinade staking
 
 ## Commands
 
 ```bash
-# Build
+# Build all
 cargo build-sbf --manifest-path programs/lp-vault/Cargo.toml
 cargo build-sbf --manifest-path programs/lending/Cargo.toml
+cargo build-sbf --manifest-path programs/transfer-hook/Cargo.toml
 
 # Deploy
-solana program deploy target/deploy/lp_vault.so --url devnet
-solana program deploy target/deploy/lending.so --url devnet
+solana program deploy target/deploy/lp_vault.so --url devnet --program-id BH6rAqBajhmzjVPoSqyvuyhCphGVWfKGAD7wXwJU9Y7T
 
-# Setup + E2E test
-npx ts-node scripts/setup-lp-vault.ts
-npx ts-node scripts/e2e-test.ts
+# E2E test (full DLMM CPI flow)
+ts-node scripts/e2e-test.ts
+
+# Marinade staking test
+ts-node scripts/test-marinade.ts
 ```
