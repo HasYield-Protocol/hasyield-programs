@@ -1,110 +1,203 @@
-# HasYield Programs
+# HasYield — Concentrated Liquidity Rehypothecation
 
 [![Built on Solana](https://img.shields.io/badge/Built%20on-Solana-9945FF?style=flat-square&logo=solana)](https://solana.com)
-[![Token-2022](https://img.shields.io/badge/Token--2022-hyLP%20Token-14F195?style=flat-square)](https://spl.solana.com/token-2022)
-[![Anchor](https://img.shields.io/badge/Anchor-0.31-blue?style=flat-square)](https://www.anchor-lang.com/)
-[![Meteora](https://img.shields.io/badge/Meteora-DLMM-orange?style=flat-square)](https://meteora.ag)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+[![Anchor 0.31](https://img.shields.io/badge/Anchor-0.31-blue?style=flat-square)](https://www.anchor-lang.com/)
+[![Meteora DLMM](https://img.shields.io/badge/Meteora-DLMM%20CPI-orange?style=flat-square)](https://meteora.ag)
+[![Marinade](https://img.shields.io/badge/Marinade-Staking%20CPI-teal?style=flat-square)](https://marinade.finance)
 
-> **"Every position has yield. Now unlock it."**
+**One deposit. Three yield sources. All on-chain CPI.**
 
-Anchor programs for HasYield — the first LP position composability layer on Solana. Concentrated liquidity bin rehypothecation: DLMM bins earn trading fees while SOL routes to staking and USDC routes to lending markets. Triple yield on the same capital.
+HasYield wraps Meteora DLMM concentrated liquidity positions into composable hyLP tokens (Token-2022), then rehypothecates the underlying capital across staking and lending protocols — earning triple yield from the same deposit.
 
-## The Problem
+## How Rehypothecation Works
 
-Concentrated liquidity positions on Solana (Meteora DLMM) are **non-transferable PDAs**. They earn trading fees but:
+The key insight: when you deposit SOL into a DLMM pool, that SOL sits in discrete price bins. Between trades, it's idle capital. HasYield routes that idle capital to yield-generating protocols while maintaining the DLMM position.
 
-- Can't be used as **collateral** in lending protocols
-- Can't be **traded** or transferred to another wallet
-- Can't be **composed** with other DeFi protocols
-- The SOL and USDC inside bins sit **idle** — earning fees but not staking or lending yield
+### Step-by-step flow
 
-No protocol on Solana wraps LP positions into composable tokens.
+```
+User deposits 1 SOL
+       │
+       ▼
+┌─────────────────────────────────────────────────────┐
+│                  HasYield Vault PDA                  │
+│                                                     │
+│  The vault PDA acts as a unified account that owns  │
+│  positions across multiple protocols simultaneously │
+└───────────┬──────────────┬──────────────────────────┘
+            │              │
+     ┌──────▼──────┐  ┌───▼────────────────┐
+     │  70% → DLMM │  │  30% → Marinade    │
+     │             │  │                    │
+     │ CPI to      │  │ CPI to             │
+     │ Meteora     │  │ MarBmsSgKX...      │
+     │ LBUZKhRx... │  │                    │
+     │             │  │ deposit(lamports)   │
+     │ add_liquidity│  │    → receive mSOL  │
+     │ _by_strategy │  │                    │
+     │             │  │ Vault PDA now       │
+     │ SOL goes    │  │ holds mSOL that     │
+     │ into bins   │  │ appreciates ~7% APY │
+     │ around the  │  │                    │
+     │ active      │  └────────────────────┘
+     │ price       │
+     │             │
+     │ Earns LP    │
+     │ trading     │
+     │ fees when   │
+     │ swaps cross │
+     │ these bins  │
+     └─────────────┘
+
+User receives: hyLP tokens (Token-2022) representing their share of the vault
+```
+
+### What makes this rehypothecation, not just "multi-protocol farming"
+
+**Traditional approach:** User deposits SOL to Protocol A, gets receipt token, deposits receipt to Protocol B. Each protocol sees different collateral. Capital is split.
+
+**HasYield approach:** The vault PDA owns ALL positions. It deposits the SAME SOL to Meteora DLMM for LP fees AND routes a portion to Marinade for staking yield. The user holds a single hyLP token representing their share of everything. The capital is rehypothecated — used in multiple protocols simultaneously through one unified vault.
+
+The vault PDA (`9t6Zv8xtZrogbZL44EqdXknNHgron5MTdtSvTHww1vpc`) is:
+- The **owner** of the Meteora DLMM position
+- The **depositor** into Marinade Finance
+- The **token authority** for vault token accounts
+- The **mint authority** for hyLP tokens
+
+One PDA, three protocols, all via CPI.
+
+### Yield sources explained
+
+| Source | Protocol | How it works | CPI instruction |
+|--------|----------|-------------|-----------------|
+| **LP Trading Fees** | Meteora DLMM | SOL+USDC placed in concentrated bins. When trades cross these price ranges, the vault earns swap fees. Claimed via `claim_fee` CPI. | `add_liquidity_by_strategy` → `claim_fee` |
+| **Staking Yield** | Marinade Finance | 30% of deposited SOL routes to Marinade's liquid staking pool. Vault receives mSOL which appreciates in value as validators earn rewards. | `deposit` (SOL→mSOL) |
+| **Lending Yield** | HasYield Lending / Solend (future) | USDC routes to lending pool where borrowers pay interest. Currently uses HasYield's own lending pool; Solend CPI code deployed for future integration. | `deposit_reserve_liquidity` |
+
+### The hyLP token
+
+hyLP is a **Token-2022** token with a **Transfer Hook**. This enables:
+
+- **Composability** — hyLP can be transferred, traded, or used in other protocols
+- **Collateral lockup** — when hyLP is deposited as collateral in the lending pool, the transfer hook blocks transfers until the loan is repaid
+- **Share-based accounting** — hyLP uses ERC4626-style vault math. As fees accrue, each hyLP becomes worth more SOL+USDC
+
+```
+hyLP value = (total_deposited_x + total_deposited_y + accrued_fees) / total_shares
+```
+
+### Borrowing against LP positions
+
+With hyLP as a composable token, users can deposit it as collateral to borrow USDC:
+
+```
+User has hyLP  →  deposit_collateral (hyLP → lending pool)
+                       │
+                       ▼
+              Transfer Hook blocks
+              hyLP transfers (locked)
+                       │
+                       ▼
+              borrow(amount) → receive USDC
+              (up to 50% LTV)
+                       │
+                       ▼
+              Position STILL earns LP fees,
+              staking yield, lending yield
+              while collateralized
+                       │
+                       ▼
+              repay(amount) → return USDC
+                       │
+                       ▼
+              withdraw_collateral → hyLP unlocked
+```
+
+This is the full rehypothecation flywheel: deposit once, earn triple yield, borrow against it without unstaking.
 
 ## Architecture
 
-```
-┌──────────────────────┐ ┌──────────────────────────┐
-│   LP Vault Program   │ │   Lending Pool Program   │
-│                      │ │                          │
-│ • deposit_liquidity  │ │ • deposit_collateral     │
-│ • withdraw_liquidity │ │ • borrow                 │
-│ • simulate_fees      │ │ • repay                  │
-│                      │ │ • withdraw_collateral    │
-│ Mints hyLP tokens    │ │                          │
-│ (Token-2022)         │ │ hyLP as collateral       │
-└──────────┬───────────┘ └──────────────────────────┘
-           │ CPI
-           ▼
-┌──────────────────────┐ ┌──────────────────────────┐
-│  Meteora DLMM        │ │  Transfer Hook Program   │
-│                      │ │                          │
-│ • add_liquidity      │ │ • Collateral lockup      │
-│ • remove_liquidity   │ │ • Block transfer while   │
-│ • claim_fee          │ │   borrowed against       │
-└──────────────────────┘ └──────────────────────────┘
-```
-
 ### Programs
 
-| Program | Description | Address (Devnet) |
-|---------|-------------|-----------------|
-| **LP Vault** | Deposits into Meteora DLMM, mints hyLP Token-2022 shares | `BH6rAqBajhmzjVPoSqyvuyhCphGVWfKGAD7wXwJU9Y7T` |
-| **Lending Pool** | Accepts hyLP as collateral, enables SOL/USDC borrowing (50% LTV) | `J9cqrTyPAajYNUp5ayDQBso7mMAwyatNg7VMpx8wbzwf` |
-| **Transfer Hook** | Enforces collateral lockup — blocks hyLP transfer while borrowed against | `EupPmtNiCUWcPGh4ekjLUVhf5PqZWV8BN5zE7426n9vM` |
+| Program | Address (Devnet) | Role |
+|---------|-----------------|------|
+| **LP Vault** | `BH6rAqBajhmzjVPoSqyvuyhCphGVWfKGAD7wXwJU9Y7T` | Core vault — DLMM CPI, Marinade CPI, Solend CPI, hyLP mint/burn |
+| **Lending Pool** | `J9cqrTyPAajYNUp5ayDQBso7mMAwyatNg7VMpx8wbzwf` | hyLP collateral, USDC borrowing, 50% LTV, 5% APR |
+| **Transfer Hook** | `EupPmtNiCUWcPGh4ekjLUVhf5PqZWV8BN5zE7426n9vM` | Collateral lockup enforcement via Token-2022 |
 
-### Triple Yield Flywheel
+### External protocol CPIs
 
-```
-Deposit SOL + USDC → HasYield Vault → Meteora DLMM bins
-                                           │
-                     ┌─────────────────────┼─────────────────────┐
-                     │                     │                     │
-                LP Trading Fees      SOL → Staking          USDC → Lending
-                (30-60% APY)        (~7% APY)              (~12% APY)
-                     │                     │                     │
-                     └─────────────────────┼─────────────────────┘
-                                           │
-                                Triple Yield: up to ~79% APY
-```
+| Protocol | Program ID | CPI Method | Devnet Status |
+|----------|-----------|------------|---------------|
+| **Meteora DLMM** | `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo` | Raw `invoke_signed` with IDL discriminators | **Proven** — deposit/withdraw/claim fees |
+| **Marinade Finance** | `MarBmsSgKXdrN1egZf5sqe1TMai9K1rChYNDJgjq7aD` | Raw `invoke_signed` with Anchor discriminators | **Proven** — SOL→mSOL staking |
+| **Solend** | `ALend7Ketfx5bxh6ghsCDXAoDrhvEmsXT3cynB6aPLgx` | Raw `invoke_signed` with SPL tag bytes | Code deployed, devnet reserve pending |
 
-## Why Solana
+All CPIs use `invoke_signed` with the vault PDA as signer — no external crate dependencies, no `declare_program!`. The vault constructs instruction data from known discriminators and serializes arguments directly.
 
-- **Token-2022 Transfer Hooks** enforce collateral lockup at the token level — not via wrapper contracts
-- **Meteora DLMM** bins are Solana-native concentrated liquidity with CPI support
-- **Composability** — hyLP tokens work across the entire Solana DeFi ecosystem
+### Key design decisions
+
+**Raw CPI over declare_program!** — Avoids Anchor version mismatches between our program (0.31) and external programs (various versions). The IDL discriminators are stable; the CPI is just bytes.
+
+**SpotImBalanced strategy for single-sided deposits** — When a user deposits only SOL (no USDC), the vault uses Meteora's `SpotImBalanced` strategy (variant 6) with `parameteres[0] = 0` (favor Y side). This places liquidity in bins below the active price, matching how the Meteora SDK handles single-sided deposits.
+
+**Two's complement bin array PDAs** — Negative bin IDs (e.g., bin -34) require `i64` two's complement encoding in PDA seeds, not unsigned `BN.toArrayLike()`. This was a critical bug that caused silent PDA mismatches.
+
+**Vault authority as universal signer** — One PDA signs for DLMM position ownership, Marinade deposits, Solend deposits, and hyLP mint authority. This is what enables rehypothecation — the vault is a single entity across all protocols.
 
 ## Getting Started
 
 ### Prerequisites
 
-- Rust 1.75+
-- Solana CLI 2.2+
-- Anchor CLI 0.31+
-- Node.js 18+
+- Rust 1.75+ / Solana CLI 2.2+ / Anchor 0.31+ / Node.js 18+
 
-### Build & Deploy
+### Build & Test
 
 ```bash
-# Install dependencies
 npm install
 
-# Build programs
+# Build
 cargo build-sbf --manifest-path programs/lp-vault/Cargo.toml
 cargo build-sbf --manifest-path programs/lending/Cargo.toml
-cargo build-sbf --manifest-path programs/transfer-hook/Cargo.toml
 
 # Deploy to devnet
-solana program deploy target/deploy/lp_vault.so --url devnet
-solana program deploy target/deploy/lending.so --url devnet
-solana program deploy target/deploy/transfer_hook.so --url devnet
+solana program deploy target/deploy/lp_vault.so --url devnet \
+  --program-id BH6rAqBajhmzjVPoSqyvuyhCphGVWfKGAD7wXwJU9Y7T
 
-# Setup LP vault on devnet
-npx ts-node scripts/setup-lp-vault.ts
+# Full E2E test (DLMM deposit → claim fees → withdraw)
+ts-node scripts/e2e-test.ts
 
-# Run E2E test
-npx ts-node scripts/e2e-test.ts
+# Marinade staking test (SOL → mSOL via vault PDA)
+ts-node scripts/test-marinade.ts
 ```
+
+### Frontend
+
+See [hasyield-app](https://github.com/HasYield-Protocol/hasyield-app) — Next.js 16 vault dashboard with real wallet transactions.
+
+## Devnet Addresses
+
+| Account | Address |
+|---------|---------|
+| Vault Config | `5hAGZFirTf7yB9MAfF4MN2iyQ89xDjSewymBAJ5gKZ21` |
+| Vault Authority | `9t6Zv8xtZrogbZL44EqdXknNHgron5MTdtSvTHww1vpc` |
+| hyLP Mint | `58WoS25fsv2Pod6LkcuvrsF5p19YFfavmaAJAjRuvvMF` |
+| DLMM Position | `F3uAc3cjmyRQAvDae2DygXHmmKowhPhZmtzqb1yEanGg` |
+| DLMM Pool | `EUcPNLCoVFb4YTM87m4Kudv3PAG71k5wGxy2Pug5YknE` |
+| Lending Pool | `AGWpvCjV3sHwkNWLtyT2837URzWmGNGffa5W4eYg1kHR` |
+| Vault mSOL | `BhEC5GeSJxgCu4c3w2eZzvm6f5tAwdR8nWTKAtQiTR6B` |
+
+## Roadmap
+
+- [x] Meteora DLMM CPI — real concentrated liquidity
+- [x] Marinade staking CPI — SOL→mSOL yield
+- [x] hyLP Token-2022 with transfer hook
+- [x] Lending pool with collateral/borrow/repay
+- [x] Frontend with wallet integration
+- [ ] Solend/Kamino lending CPI (code deployed, needs devnet reserve)
+- [ ] Auto-rebalance — AI-driven yield optimization across protocols
+- [ ] Multi-pool support (SOL/USDT, ETH/USDC, JUP/USDC)
+- [ ] Yield tokenization (PT/YT split)
 
 ## Hackathon
 
