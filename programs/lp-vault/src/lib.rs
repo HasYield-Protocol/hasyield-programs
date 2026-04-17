@@ -60,7 +60,8 @@ pub mod lp_vault {
         config.position_initialized = false;
         config.bump = ctx.bumps.vault_config;
         config.vault_authority_bump = ctx.bumps.vault_authority;
-        config._reserved = [0u8; 64];
+        config.marinade_allocation_bps = 3000; // 30% to Marinade by default
+        config._reserved = [0u8; 62];
 
         Ok(())
     }
@@ -819,6 +820,137 @@ pub mod lp_vault {
 
         Ok(())
     }
+
+    /// Rebalance SOL allocation between Marinade staking and the DLMM pool.
+    /// Shifts SOL by depositing more to Marinade or liquid-unstaking mSOL.
+    pub fn rebalance(
+        ctx: Context<Rebalance>,
+        new_marinade_bps: u16,
+    ) -> Result<()> {
+        require!(new_marinade_bps <= 10_000, LpVaultError::InvalidAllocation);
+        require!(
+            ctx.accounts.authority.key() == ctx.accounts.vault_config.authority,
+            LpVaultError::Unauthorized
+        );
+
+        let old_bps = ctx.accounts.vault_config.marinade_allocation_bps;
+
+        let config_key = ctx.accounts.vault_config.key();
+        let vault_auth_seeds: &[&[u8]] = &[
+            b"vault-authority",
+            config_key.as_ref(),
+            &[ctx.accounts.vault_config.vault_authority_bump],
+        ];
+
+        if new_marinade_bps > old_bps {
+            // Need to deposit more SOL to Marinade
+            let delta_bps = (new_marinade_bps - old_bps) as u64;
+            let vault_sol = ctx.accounts.vault_authority.lamports();
+            let lamports = vault_sol
+                .checked_mul(delta_bps)
+                .ok_or(LpVaultError::MathOverflow)?
+                / 10_000u64;
+
+            if lamports > 0 {
+                let mut ix_data = Vec::with_capacity(16);
+                ix_data.extend_from_slice(&IX_MARINADE_DEPOSIT);
+                ix_data.extend_from_slice(&lamports.to_le_bytes());
+
+                let ix = Instruction {
+                    program_id: MARINADE_PROGRAM,
+                    accounts: vec![
+                        AccountMeta::new(ctx.accounts.marinade_state.key(), false),
+                        AccountMeta::new(ctx.accounts.msol_mint.key(), false),
+                        AccountMeta::new(ctx.accounts.liq_pool_sol_leg_pda.key(), false),
+                        AccountMeta::new(ctx.accounts.liq_pool_msol_leg.key(), false),
+                        AccountMeta::new_readonly(ctx.accounts.liq_pool_msol_leg_authority.key(), false),
+                        AccountMeta::new(ctx.accounts.reserve_pda.key(), false),
+                        AccountMeta::new(ctx.accounts.vault_authority.key(), true),
+                        AccountMeta::new(ctx.accounts.vault_msol_ata.key(), false),
+                        AccountMeta::new_readonly(ctx.accounts.msol_mint_authority.key(), false),
+                        AccountMeta::new_readonly(ctx.accounts.system_program.key(), false),
+                        AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+                    ],
+                    data: ix_data,
+                };
+
+                invoke_signed(
+                    &ix,
+                    &[
+                        ctx.accounts.marinade_state.to_account_info(),
+                        ctx.accounts.msol_mint.to_account_info(),
+                        ctx.accounts.liq_pool_sol_leg_pda.to_account_info(),
+                        ctx.accounts.liq_pool_msol_leg.to_account_info(),
+                        ctx.accounts.liq_pool_msol_leg_authority.to_account_info(),
+                        ctx.accounts.reserve_pda.to_account_info(),
+                        ctx.accounts.vault_authority.to_account_info(),
+                        ctx.accounts.vault_msol_ata.to_account_info(),
+                        ctx.accounts.msol_mint_authority.to_account_info(),
+                        ctx.accounts.system_program.to_account_info(),
+                        ctx.accounts.token_program.to_account_info(),
+                        ctx.accounts.marinade_program.to_account_info(),
+                    ],
+                    &[vault_auth_seeds],
+                )?;
+            }
+        } else if new_marinade_bps < old_bps {
+            // Need to unstake mSOL back to SOL
+            let delta_bps = (old_bps - new_marinade_bps) as u64;
+            ctx.accounts.vault_msol_ata.reload()?;
+            let msol_balance = ctx.accounts.vault_msol_ata.amount;
+            let msol_to_unstake = msol_balance
+                .checked_mul(delta_bps)
+                .ok_or(LpVaultError::MathOverflow)?
+                / old_bps as u64;
+
+            if msol_to_unstake > 0 {
+                let mut ix_data = Vec::with_capacity(16);
+                ix_data.extend_from_slice(&IX_MARINADE_LIQUID_UNSTAKE);
+                ix_data.extend_from_slice(&msol_to_unstake.to_le_bytes());
+
+                let ix = Instruction {
+                    program_id: MARINADE_PROGRAM,
+                    accounts: vec![
+                        AccountMeta::new(ctx.accounts.marinade_state.key(), false),
+                        AccountMeta::new(ctx.accounts.msol_mint.key(), false),
+                        AccountMeta::new(ctx.accounts.liq_pool_sol_leg_pda.key(), false),
+                        AccountMeta::new(ctx.accounts.liq_pool_msol_leg.key(), false),
+                        AccountMeta::new(ctx.accounts.treasury_msol_account.key(), false),
+                        AccountMeta::new(ctx.accounts.vault_msol_ata.key(), false),
+                        AccountMeta::new_readonly(ctx.accounts.vault_authority.key(), true),
+                        AccountMeta::new(ctx.accounts.vault_authority.key(), false),
+                        AccountMeta::new_readonly(ctx.accounts.system_program.key(), false),
+                        AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+                    ],
+                    data: ix_data,
+                };
+
+                invoke_signed(
+                    &ix,
+                    &[
+                        ctx.accounts.marinade_state.to_account_info(),
+                        ctx.accounts.msol_mint.to_account_info(),
+                        ctx.accounts.liq_pool_sol_leg_pda.to_account_info(),
+                        ctx.accounts.liq_pool_msol_leg.to_account_info(),
+                        ctx.accounts.treasury_msol_account.to_account_info(),
+                        ctx.accounts.vault_msol_ata.to_account_info(),
+                        ctx.accounts.vault_authority.to_account_info(),
+                        ctx.accounts.vault_authority.to_account_info(),
+                        ctx.accounts.system_program.to_account_info(),
+                        ctx.accounts.token_program.to_account_info(),
+                        ctx.accounts.marinade_program.to_account_info(),
+                    ],
+                    &[vault_auth_seeds],
+                )?;
+            }
+        }
+
+        msg!("Rebalanced: {} bps -> {} bps", old_bps, new_marinade_bps);
+        let config = &mut ctx.accounts.vault_config;
+        config.marinade_allocation_bps = new_marinade_bps;
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -840,12 +972,13 @@ pub struct LpVaultConfig {
     pub position_initialized: bool,
     pub bump: u8,
     pub vault_authority_bump: u8,
-    pub _reserved: [u8; 64],
+    pub marinade_allocation_bps: u16,
+    pub _reserved: [u8; 62],
 }
 
 impl LpVaultConfig {
-    // 8 discriminator + 32*4 + 8*4 + 4*2 + 1 + 1 + 1 + 64 = 243
-    pub const SIZE: usize = 8 + 32 + 32 + 32 + 32 + 8 + 8 + 8 + 8 + 4 + 4 + 1 + 1 + 1 + 64;
+    // 8 discriminator + 32*4 + 8*4 + 4*2 + 1 + 1 + 1 + 2 + 62 = 243
+    pub const SIZE: usize = 8 + 32 + 32 + 32 + 32 + 8 + 8 + 8 + 8 + 4 + 4 + 1 + 1 + 1 + 2 + 62;
 }
 
 /// Placeholder for vault authority PDA (just holds bump)
@@ -1377,6 +1510,66 @@ pub struct WithdrawFromSolend<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
+#[derive(Accounts)]
+pub struct Rebalance<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(mut)]
+    pub vault_config: Account<'info, LpVaultConfig>,
+
+    /// CHECK: vault authority PDA — holds SOL, signs Marinade CPIs
+    #[account(
+        mut,
+        seeds = [b"vault-authority", vault_config.key().as_ref()],
+        bump = vault_config.vault_authority_bump,
+    )]
+    pub vault_authority: UncheckedAccount<'info>,
+
+    // --- Marinade accounts (superset for deposit + unstake) ---
+
+    /// CHECK: Marinade state account
+    #[account(mut)]
+    pub marinade_state: UncheckedAccount<'info>,
+
+    /// CHECK: mSOL mint
+    #[account(mut)]
+    pub msol_mint: UncheckedAccount<'info>,
+
+    /// CHECK: Marinade liq pool SOL leg PDA
+    #[account(mut)]
+    pub liq_pool_sol_leg_pda: UncheckedAccount<'info>,
+
+    /// CHECK: Marinade liq pool mSOL leg token account
+    #[account(mut)]
+    pub liq_pool_msol_leg: UncheckedAccount<'info>,
+
+    /// CHECK: Marinade liq pool mSOL leg authority PDA (for deposit)
+    pub liq_pool_msol_leg_authority: UncheckedAccount<'info>,
+
+    /// CHECK: Marinade reserve PDA (for deposit)
+    #[account(mut)]
+    pub reserve_pda: UncheckedAccount<'info>,
+
+    /// CHECK: Marinade treasury mSOL account (for unstake)
+    #[account(mut)]
+    pub treasury_msol_account: UncheckedAccount<'info>,
+
+    /// Vault's mSOL token account
+    #[account(mut)]
+    pub vault_msol_ata: InterfaceAccount<'info, TokenAccount>,
+
+    /// CHECK: mSOL mint authority PDA (for deposit)
+    pub msol_mint_authority: UncheckedAccount<'info>,
+
+    /// CHECK: Marinade program
+    #[account(address = MARINADE_PROGRAM)]
+    pub marinade_program: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -1401,4 +1594,6 @@ pub enum LpVaultError {
     InvalidWidth,
     #[msg("Amount must be greater than zero")]
     ZeroAmount,
+    #[msg("Allocation must be <= 10000 bps")]
+    InvalidAllocation,
 }
