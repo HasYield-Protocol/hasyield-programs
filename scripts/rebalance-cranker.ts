@@ -3,7 +3,11 @@
  * allocation, and calls the vault's `rebalance` instruction when the delta
  * exceeds a threshold.
  *
- * Run:  ts-node scripts/rebalance-cranker.ts
+ * Run once:  ts-node scripts/rebalance-cranker.ts
+ * Loop:      ts-node scripts/rebalance-cranker.ts --loop [--interval=21600]
+ *
+ * Every run appends one JSON line to `run-log.jsonl` with the decision and
+ * tx signature so the frontend can show live "last run / next run" status.
  */
 import {
   Connection, Keypair, PublicKey, SystemProgram, Transaction,
@@ -65,6 +69,29 @@ const DEFAULT_MARINADE_BPS = 3000;      // 30%
 //   = 179
 const MARINADE_BPS_OFFSET = 179;
 
+// Run log — one JSON line per invocation, tail-readable for the frontend
+const RUN_LOG_PATH = path.join(__dirname, "..", "run-log.jsonl");
+
+type RunLog = {
+  timestamp: string;
+  marinadeApy: number | null;
+  currentBps: number | null;
+  optimalBps: number | null;
+  deltaBps: number | null;
+  decision: "skipped" | "rebalanced" | "error";
+  txSig?: string;
+  error?: string;
+};
+
+function appendRunLog(entry: RunLog) {
+  try {
+    fs.appendFileSync(RUN_LOG_PATH, JSON.stringify(entry) + "\n");
+  } catch (err) {
+    // Never crash the cranker on log write failure
+    console.error("Failed to append run log:", (err as Error).message);
+  }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function disc(name: string): Buffer {
@@ -73,11 +100,23 @@ function disc(name: string): Buffer {
 
 /** Fetch Marinade 30-day rolling APY. Returns a decimal (e.g. 0.072 = 7.2%). */
 async function fetchMarinadeApy(): Promise<number> {
-  const resp = await fetch("https://api.marinade.finance/msol/apy/30d");
-  if (!resp.ok) throw new Error(`Marinade API error: ${resp.status} ${resp.statusText}`);
-  const apy = Number(await resp.text());
-  if (isNaN(apy)) throw new Error("Marinade API returned non-numeric APY");
-  return apy;
+  // Try 30d window, fall back to 7d, then 1d
+  for (const window of ["30d", "7d", "1d"]) {
+    const resp = await fetch(`https://api.marinade.finance/msol/apy/${window}`);
+    if (!resp.ok) continue;
+    const text = await resp.text();
+    // API shape as of 2026-04: { value: number, start_price, end_price, ... }
+    try {
+      const parsed = JSON.parse(text);
+      if (typeof parsed === "number") return parsed;
+      if (typeof parsed?.value === "number") return parsed.value;
+    } catch {
+      // Legacy: plain numeric string
+      const n = Number(text);
+      if (!isNaN(n)) return n;
+    }
+  }
+  throw new Error("Marinade API returned no usable APY across 30d/7d/1d");
 }
 
 /**
@@ -113,7 +152,8 @@ async function readCurrentAllocation(connection: Connection): Promise<number> {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
-async function main() {
+async function runOnce(): Promise<RunLog> {
+  const timestamp = new Date().toISOString();
   const connection = new Connection(RPC, "confirmed");
   const keypairPath = path.join(os.homedir(), ".config", "solana", "id.json");
   const payer = Keypair.fromSecretKey(
@@ -121,7 +161,7 @@ async function main() {
   );
 
   console.log("═══════════════════════════════════════════════════");
-  console.log("HasYield Rebalance Cranker");
+  console.log("HasYield Rebalance Cranker  @", timestamp);
   console.log("═══════════════════════════════════════════════════");
   console.log("Payer:          ", payer.publicKey.toBase58());
   console.log("Vault Config:   ", VAULT_CONFIG_PUBKEY.toBase58());
@@ -147,7 +187,15 @@ async function main() {
     currentBps = await readCurrentAllocation(connection);
   } catch (err: any) {
     console.error("Failed to read vault config:", err.message);
-    process.exit(1);
+    return {
+      timestamp,
+      marinadeApy,
+      currentBps: null,
+      optimalBps,
+      deltaBps: null,
+      decision: "error",
+      error: `vault_config_read: ${err.message?.slice(0, 200)}`,
+    };
   }
 
   const deltaBps = Math.abs(optimalBps - currentBps);
@@ -160,7 +208,7 @@ async function main() {
   // ── Step 4: Decide whether to rebalance ───────────────────────────────────
   if (deltaBps <= REBALANCE_THRESHOLD_BPS) {
     console.log(`\nDelta ${deltaBps} bps <= threshold ${REBALANCE_THRESHOLD_BPS} bps -> NO REBALANCE NEEDED`);
-    process.exit(0);
+    return { timestamp, marinadeApy, currentBps, optimalBps, deltaBps, decision: "skipped" };
   }
 
   console.log(`\nDelta ${deltaBps} bps > threshold ${REBALANCE_THRESHOLD_BPS} bps -> REBALANCING`);
@@ -220,18 +268,81 @@ async function main() {
     const sig = await sendAndConfirmTransaction(connection, tx, [payer]);
     console.log("\nRebalance TX confirmed:", sig);
     console.log(`Updated marinade_allocation_bps: ${currentBps} -> ${optimalBps}`);
+    return { timestamp, marinadeApy, currentBps, optimalBps, deltaBps, decision: "rebalanced", txSig: sig };
   } catch (err: any) {
     console.error("\nRebalance TX failed:", err.message?.slice(0, 500));
     if (err.logs) {
       console.log("\nProgram logs:");
       for (const log of err.logs.slice(-15)) console.log("  ", log);
     }
-    process.exit(1);
+    return {
+      timestamp, marinadeApy, currentBps, optimalBps, deltaBps,
+      decision: "error",
+      error: `rebalance_tx: ${err.message?.slice(0, 200)}`,
+    };
   }
-
-  console.log("\n═══════════════════════════════════════════════════");
-  console.log("CRANKER COMPLETE");
-  console.log("═══════════════════════════════════════════════════");
 }
 
-main().catch(err => { console.error("Fatal:", err.message); process.exit(1); });
+// ─── Entry point: single-shot vs --loop ──────────────────────────────────────
+
+function parseLoopArgs() {
+  const args = process.argv.slice(2);
+  const loop = args.includes("--loop");
+  const intervalArg = args.find(a => a.startsWith("--interval="));
+  const intervalSec = intervalArg ? parseInt(intervalArg.split("=")[1], 10) : 21600; // 6h
+  return { loop, intervalSec: Number.isFinite(intervalSec) && intervalSec > 0 ? intervalSec : 21600 };
+}
+
+async function main() {
+  const { loop, intervalSec } = parseLoopArgs();
+
+  if (!loop) {
+    const log = await runOnce();
+    appendRunLog(log);
+    console.log("\n═══════════════════════════════════════════════════");
+    console.log("CRANKER COMPLETE  ·  decision:", log.decision);
+    console.log("═══════════════════════════════════════════════════");
+    process.exit(log.decision === "error" ? 1 : 0);
+  }
+
+  console.log(`\n⟳ Loop mode  ·  interval ${intervalSec}s (${(intervalSec / 3600).toFixed(1)}h)\n`);
+  let shuttingDown = false;
+  const shutdown = (sig: string) => {
+    console.log(`\n${sig} received — exiting after current run.`);
+    shuttingDown = true;
+  };
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+  // run immediately on boot so the log isn't empty for Xh
+  while (!shuttingDown) {
+    try {
+      const log = await runOnce();
+      appendRunLog(log);
+    } catch (err: any) {
+      const log: RunLog = {
+        timestamp: new Date().toISOString(),
+        marinadeApy: null, currentBps: null, optimalBps: null, deltaBps: null,
+        decision: "error",
+        error: `unhandled: ${err.message?.slice(0, 200)}`,
+      };
+      appendRunLog(log);
+      console.error("\nUnhandled error in runOnce:", err.message);
+    }
+    if (shuttingDown) break;
+    console.log(`\n⟳ Next run in ${intervalSec}s @ ${new Date(Date.now() + intervalSec * 1000).toISOString()}\n`);
+    await new Promise(r => setTimeout(r, intervalSec * 1000));
+  }
+  process.exit(0);
+}
+
+main().catch(err => {
+  console.error("Fatal:", err.message);
+  appendRunLog({
+    timestamp: new Date().toISOString(),
+    marinadeApy: null, currentBps: null, optimalBps: null, deltaBps: null,
+    decision: "error",
+    error: `main_fatal: ${err.message?.slice(0, 200)}`,
+  });
+  process.exit(1);
+});

@@ -8,3 +8,4 @@ test-ledger/
 .anchor/
 yarn.lock
 .DS_Store
+run-log.jsonl
