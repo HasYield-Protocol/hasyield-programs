@@ -1,10 +1,10 @@
 /**
- * Yield Rate Cranker — fetches protocol yields, computes optimal Marinade
+ * HasYield Keeper — fetches protocol yields, computes optimal Marinade
  * allocation, and calls the vault's `rebalance` instruction when the delta
  * exceeds a threshold.
  *
- * Run once:  ts-node scripts/rebalance-cranker.ts
- * Loop:      ts-node scripts/rebalance-cranker.ts --loop [--interval=21600]
+ * Run once:  ts-node scripts/keeper.ts
+ * Loop:      ts-node scripts/keeper.ts --loop [--interval=21600]
  *
  * Every run appends one JSON line to `run-log.jsonl` with the decision and
  * tx signature so the frontend can show live "last run / next run" status.
@@ -55,7 +55,7 @@ const [MSOL_MINT_AUTH] = PublicKey.findProgramAddressSync(
 const USDC_MINT = new PublicKey("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
 const WSOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
 
-// Cranker parameters
+// Keeper parameters
 const DLMM_APY_CONSTANT = 0.12;        // 12% — configurable placeholder
 const REBALANCE_THRESHOLD_BPS = 500;    // only rebalance if delta > 5%
 const MIN_MARINADE_BPS = 1000;          // 10%
@@ -87,7 +87,7 @@ function appendRunLog(entry: RunLog) {
   try {
     fs.appendFileSync(RUN_LOG_PATH, JSON.stringify(entry) + "\n");
   } catch (err) {
-    // Never crash the cranker on log write failure
+    // Never crash the keeper on log write failure
     console.error("Failed to append run log:", (err as Error).message);
   }
 }
@@ -161,7 +161,7 @@ async function runOnce(): Promise<RunLog> {
   );
 
   console.log("═══════════════════════════════════════════════════");
-  console.log("HasYield Rebalance Cranker  @", timestamp);
+  console.log("HasYield HasYield Keeper  @", timestamp);
   console.log("═══════════════════════════════════════════════════");
   console.log("Payer:          ", payer.publicKey.toBase58());
   console.log("Vault Config:   ", VAULT_CONFIG_PUBKEY.toBase58());
@@ -320,7 +320,7 @@ async function main() {
     const log = await runOnce();
     appendRunLog(log);
     console.log("\n═══════════════════════════════════════════════════");
-    console.log("CRANKER COMPLETE  ·  decision:", log.decision);
+    console.log("KEEPER COMPLETE  ·  decision:", log.decision);
     console.log("═══════════════════════════════════════════════════");
     process.exit(log.decision === "error" ? 1 : 0);
   }
