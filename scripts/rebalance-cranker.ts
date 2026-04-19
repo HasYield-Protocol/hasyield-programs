@@ -230,6 +230,27 @@ async function runOnce(): Promise<RunLog> {
     MSOL_MINT, vaultAuthority, true, TOKEN_PROGRAM_ID,
   );
 
+  // Top up vault authority so the rebalance math doesn't drain it below rent-exempt.
+  // The Rust instruction stakes `delta_bps / 10_000` of the authority's TOTAL SOL on
+  // deposit-side rebalances; on a lightly-funded devnet vault that can pop the Marinade
+  // liq pool's SOL leg below rent. Buffer it.
+  {
+    const current = await connection.getBalance(vaultAuthority);
+    const TOPUP_FLOOR = 10_000_000; // 0.01 SOL
+    if (current < TOPUP_FLOOR) {
+      const need = TOPUP_FLOOR - current;
+      const topup = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: payer.publicKey,
+          toPubkey: vaultAuthority,
+          lamports: need,
+        }),
+      );
+      const sig = await sendAndConfirmTransaction(connection, topup, [payer]);
+      console.log(`Topped up vault authority with ${need} lamports: ${sig}`);
+    }
+  }
+
   // Build instruction data: 8-byte discriminator + 2-byte new_marinade_bps (u16 LE)
   const data = Buffer.alloc(8 + 2);
   disc("rebalance").copy(data, 0);
@@ -239,26 +260,25 @@ async function runOnce(): Promise<RunLog> {
     ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
     {
       programId: LP_VAULT_PROGRAM,
+      // Order MUST match the Rust `Rebalance` struct in lp-vault/src/lib.rs.
+      // Drift here = AnchorError 3007 (AccountOwnedByWrongProgram), because
+      // Anchor deserializes accounts positionally.
       keys: [
-        // Authority (signer)
-        { pubkey: payer.publicKey, isSigner: true, isWritable: true },
-        // Vault accounts
-        { pubkey: vaultConfig, isSigner: false, isWritable: true },
-        { pubkey: vaultAuthority, isSigner: false, isWritable: true },
-        // Marinade accounts (same layout as deposit_to_marinade)
-        { pubkey: MARINADE_STATE, isSigner: false, isWritable: true },
-        { pubkey: MSOL_MINT, isSigner: false, isWritable: true },
-        { pubkey: LIQ_SOL_LEG, isSigner: false, isWritable: true },
-        { pubkey: LIQ_POOL_MSOL_LEG, isSigner: false, isWritable: true },
-        { pubkey: LIQ_MSOL_AUTH, isSigner: false, isWritable: false },
-        { pubkey: RESERVE_PDA, isSigner: false, isWritable: true },
-        { pubkey: vaultMsolAta, isSigner: false, isWritable: true },
-        { pubkey: MSOL_MINT_AUTH, isSigner: false, isWritable: false },
-        { pubkey: TREASURY_MSOL_DEVNET, isSigner: false, isWritable: true },
-        // Programs
-        { pubkey: MARINADE_PROGRAM, isSigner: false, isWritable: false },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: payer.publicKey, isSigner: true, isWritable: true }, //  1 authority
+        { pubkey: vaultConfig, isSigner: false, isWritable: true },    //  2 vault_config
+        { pubkey: vaultAuthority, isSigner: false, isWritable: true }, //  3 vault_authority
+        { pubkey: MARINADE_STATE, isSigner: false, isWritable: true }, //  4 marinade_state
+        { pubkey: MSOL_MINT, isSigner: false, isWritable: true },      //  5 msol_mint
+        { pubkey: LIQ_SOL_LEG, isSigner: false, isWritable: true },    //  6 liq_pool_sol_leg_pda
+        { pubkey: LIQ_POOL_MSOL_LEG, isSigner: false, isWritable: true }, // 7 liq_pool_msol_leg
+        { pubkey: LIQ_MSOL_AUTH, isSigner: false, isWritable: false }, //  8 liq_pool_msol_leg_authority
+        { pubkey: RESERVE_PDA, isSigner: false, isWritable: true },    //  9 reserve_pda
+        { pubkey: TREASURY_MSOL_DEVNET, isSigner: false, isWritable: true }, // 10 treasury_msol_account
+        { pubkey: vaultMsolAta, isSigner: false, isWritable: true },   // 11 vault_msol_ata
+        { pubkey: MSOL_MINT_AUTH, isSigner: false, isWritable: false }, // 12 msol_mint_authority
+        { pubkey: MARINADE_PROGRAM, isSigner: false, isWritable: false }, // 13 marinade_program
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }, // 14 system_program
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false }, // 15 token_program
       ],
       data,
     },
